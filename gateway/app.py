@@ -18,6 +18,7 @@ import os
 import re
 import json
 import hashlib
+import uuid
 import datetime
 
 import httpx
@@ -35,6 +36,8 @@ SHRINK_AUTO = os.environ.get("SHRINK_AUTO", "0") == "1"          # auto-shrink l
 AUTO_BUDGET = int(os.environ.get("SHRINK_AUTO_BUDGET", "60000")) # only auto-shrink above this many tokens
 TOP_K = int(os.environ.get("SHRINK_TOP_K", "10"))
 CHUNK_CHARS = int(os.environ.get("SHRINK_CHUNK_CHARS", "1600"))
+SUMMARY_MAX_NEW = int(os.environ.get("SHRINK_SUMMARY_MAX_NEW_CHUNKS", "24"))  # cap summarized/req
+SUMMARY_BATCH = int(os.environ.get("SHRINK_SUMMARY_BATCH", "8"))
 os.makedirs(LOGDIR, exist_ok=True)
 
 app = FastAPI()
@@ -145,18 +148,51 @@ def lexical_top(chunks, query, k):
     return [i for _, i in scored[:k]]
 
 
-def assemble_shrink(system, selected_chunks, tail):
-    retrieved = "\n\n---\n".join(selected_chunks)
-    recall_msg = {
-        "role": "system",
-        "content": (
-            "[Mnemosyne] The full conversation/context is too large for the window and "
-            "is stored externally. Below are the MOST RELEVANT retrieved excerpts for the "
-            "current question. Treat them as authoritative context:\n\n"
-            f"{retrieved}\n\n[End of retrieved context]"
-        ),
-    }
-    return system + [recall_msg] + tail
+def assemble_shrink(system, selected_chunks, tail, summary=""):
+    msgs = list(system)
+    if summary:
+        msgs.append({"role": "system", "content":
+                     "[Mnemosyne running summary] A condensed memory of the earlier "
+                     "conversation that no longer fits the window:\n\n" + summary})
+    if selected_chunks:
+        retrieved = "\n\n---\n".join(selected_chunks)
+        msgs.append({"role": "system", "content":
+                     "[Mnemosyne] Most relevant retrieved excerpts for the current "
+                     "question:\n\n" + retrieved + "\n\n[End of retrieved context]"})
+    return msgs + tail
+
+
+def _chunk_id(cid, text):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, cid + "|" + text))
+
+
+async def _llm(messages, model, auth, max_tokens=600):
+    headers = {"Content-Type": "application/json"}
+    if auth:
+        headers["Authorization"] = auth   # forward the provider key (else Gonka 401 -> empty)
+    r = await client.post(f"{UPSTREAM}/v1/chat/completions", timeout=300, headers=headers,
+                          json={"model": model, "messages": messages, "stream": False,
+                                "temperature": 0, "max_tokens": max_tokens})
+    d = r.json()
+    return (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+
+
+async def update_summary(model, auth, existing, new_chunks):
+    """Batch-summarize new chunks, then fold into the running summary (hierarchical:
+    old + new are recompressed under a size cap each time)."""
+    batch_summaries = []
+    for i in range(0, len(new_chunks), SUMMARY_BATCH):
+        text = "\n".join(new_chunks[i:i + SUMMARY_BATCH])
+        batch_summaries.append(await _llm(
+            [{"role": "system", "content": "Summarize these conversation excerpts in 2-4 "
+              "sentences. Keep concrete facts, names, numbers and decisions."},
+             {"role": "user", "content": text}], model, auth, 300))
+    return await _llm(
+        [{"role": "system", "content": "You keep a running summary of a long conversation. "
+          "Merge the new notes into the existing summary. Preserve every concrete decision, "
+          "name, number and constraint. Be concise, under ~250 words."},
+         {"role": "user", "content": "Existing summary:\n" + (existing or "(none yet)") +
+          "\n\nNew notes:\n" + "\n".join(batch_summaries)}], model, auth, 600)
 
 
 @app.get("/healthz")
@@ -257,12 +293,35 @@ async def proxy(path: str, request: Request):
                     if selected is None:
                         idxs = sorted(set(lexical_top(chunks, query, TOP_K)))
                         selected, method = [chunks[i] for i in idxs], "lexical"
-                    new_msgs = assemble_shrink(prep["system"], selected, prep["tail"])
+
+                    # running summary of the dropped context (opt-in, incremental)
+                    summary_text = ""
+                    if request.headers.get("x-mnemosyne-summary") == "1":
+                        try:
+                            st = (await client.post(f"{STORE}/summary/get", timeout=20,
+                                                    json={"context_id": cid})).json()
+                            existing = st.get("summary", "")
+                            done = set(st.get("summarized_ids") or [])
+                            new = [c for c in chunks if _chunk_id(cid, c) not in done][:SUMMARY_MAX_NEW]
+                            if new:
+                                existing = await update_summary(
+                                    data.get("model"), request.headers.get("authorization", ""),
+                                    existing, new)
+                                await client.post(f"{STORE}/summary/set", timeout=20, json={
+                                    "context_id": cid, "summary": existing,
+                                    "add_ids": [_chunk_id(cid, c) for c in new]})
+                            summary_text = existing
+                            log(f"SUMMARY ctx={cid} new_chunks={len(new)} summary_len={len(summary_text)}")
+                        except Exception as e:
+                            log(f"summary failed: {e!r}")
+
+                    new_msgs = assemble_shrink(prep["system"], selected, prep["tail"], summary_text)
                     data["messages"] = new_msgs
                     body = json.dumps(data).encode("utf-8")
                     new_tok = approx_tokens_msgs(new_msgs)
                     log(f"SHRINK ctx={cid} {ntok} -> {new_tok} tokens | method={method} "
-                        f"chunks={len(chunks)} kept={len(selected)} indexed_new={indexed_new}")
+                        f"chunks={len(chunks)} kept={len(selected)} indexed_new={indexed_new} "
+                        f"summary={len(summary_text)}c")
         except Exception as e:
             log(f"observe/shrink error: {e!r}")
     else:

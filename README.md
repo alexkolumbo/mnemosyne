@@ -47,6 +47,8 @@ You need docker, and qdrant + an embedder if you want the vector side (there's a
 The interesting behaviour is opt-in per request via headers while it's still being hardened, so it won't touch traffic you don't ask it to:
 
 - `X-Mnemosyne-Mode: shrink` to virtualise the window for that request
+- `X-Mnemosyne-Summary: 1` to also fold the dropped context into a running summary and include it
+- `X-Mnemosyne-Retrieve: vector|lexical` to pick the retriever for the shrink (vector is the default)
 - `X-Mnemosyne-Remember: 1` to store the last user message as a long-term memory
 - `X-Mnemosyne-Recall: 1` to pull relevant memories into the window
 - `X-Mnemosyne-Namespace: <name>` to scope memory (per user, per project, whatever)
@@ -55,7 +57,7 @@ The `examples/*.py` scripts show each of these end to end.
 
 ## honest about the limits
 
-The window the model sees on any single call is still fixed. What's unbounded is the state behind it; the gateway just decides what to show. So the quality of the whole thing comes down to retrieval, and retrieval is never perfect. Both the long-term memory and the window-shrink path use vector search now, and chunks get embedded into qdrant once and reused, so a chunk is never embedded twice and repeat shrinks on the same conversation come back in well under a second. What's still missing is hierarchical summaries of the parts that get dropped, which means a heavily-shrunk long conversation keeps the facts but can lose the conversational thread. Auto-triggering on live traffic is built but left off by default until the summary work lands. None of that is hidden; it's the next set of things to do.
+The window the model sees on any single call is still fixed. What's unbounded is the state behind it; the gateway just decides what to show. So the quality of the whole thing comes down to retrieval, and retrieval is never perfect. Both the long-term memory and the window-shrink path use vector search now, and chunks get embedded into qdrant once and reused, so a chunk is never embedded twice and repeat shrinks on the same conversation come back in well under a second. On top of that there's a running summary of the dropped context, built incrementally (only new chunks get summarized, then folded into the existing summary under a size cap), which is what keeps the thread of a long conversation rather than just isolated facts. That matters when the answer depends on following the conversation: in one test a budget changed 100 to 150 to 120 to 135 with the stale 100 over-represented, and plain retrieval answered 150 while the summary path answered 135. Worth being clear about what each part is for: retrieval is for specific facts (turn up top_k if you need more of them), the summary is for the overall state. What's still left is turning all of this on automatically for live traffic by default; the machinery is there, it's just gated behind a header for now. None of that is hidden; it's the next set of things to do.
 
 ## license
 

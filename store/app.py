@@ -193,6 +193,32 @@ def _chunk_id(context_id, text):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, context_id + "|" + text))
 
 
+@app.post("/summary/get")
+async def summary_get(request: Request):
+    b = await request.json()
+    cid = _safe(b.get("context_id", "default"))
+    p = os.path.join(DATA, cid, "summary.json")
+    if os.path.exists(p):
+        return json.load(open(p))
+    return {"summary": "", "summarized_ids": []}
+
+
+@app.post("/summary/set")
+async def summary_set(request: Request):
+    b = await request.json()
+    cid = _safe(b.get("context_id", "default"))
+    d = os.path.join(DATA, cid)
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "summary.json")
+    cur = json.load(open(p)) if os.path.exists(p) else {"summary": "", "summarized_ids": []}
+    cur["summary"] = b.get("summary", cur.get("summary", ""))
+    ids = set(cur.get("summarized_ids") or [])
+    ids.update(b.get("add_ids") or [])
+    cur["summarized_ids"] = list(ids)
+    json.dump(cur, open(p, "w"), ensure_ascii=False)
+    return {"ok": True, "summary_len": len(cur["summary"]), "n_summarized": len(cur["summarized_ids"])}
+
+
 @app.post("/shrink/select")
 async def shrink_select(request: Request):
     """Window-shrink retrieval with INCREMENTAL indexing.

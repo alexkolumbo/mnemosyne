@@ -55,7 +55,7 @@ The `examples/*.py` scripts show each of these end to end.
 
 ## honest about the limits
 
-The window the model sees on any single call is still fixed. What's unbounded is the state behind it; the gateway just decides what to show. So the quality of the whole thing comes down to retrieval, and retrieval is never perfect. Right now the long-term memory uses vectors but the window-shrink path still uses keyword matching, so that side can miss on a paraphrase. There are no hierarchical summaries yet, which means a heavily-shrunk long conversation keeps the facts but can lose the conversational thread. And auto-triggering on live traffic is built but left off by default until the summary work lands. None of that is hidden; it's the next set of things to do.
+The window the model sees on any single call is still fixed. What's unbounded is the state behind it; the gateway just decides what to show. So the quality of the whole thing comes down to retrieval, and retrieval is never perfect. Both the long-term memory and the window-shrink path use vector search now, and chunks get embedded into qdrant once and reused, so a chunk is never embedded twice and repeat shrinks on the same conversation come back in well under a second. What's still missing is hierarchical summaries of the parts that get dropped, which means a heavily-shrunk long conversation keeps the facts but can lose the conversational thread. Auto-triggering on live traffic is built but left off by default until the summary work lands. None of that is hidden; it's the next set of things to do.
 
 ## license
 

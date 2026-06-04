@@ -27,7 +27,8 @@ os.makedirs(MEMDIR, exist_ok=True)
 app = FastAPI()
 
 # ── vector backend (best-effort; lexical fallback if it fails) ──────────────
-COLL = "mnemosyne_mem"
+COLL = "mnemosyne_mem"      # long-term memory
+CTX_COLL = "mnemosyne_ctx"  # conversation chunks for window-shrink (incrementally indexed)
 DIM = 384
 USE_VEC = False
 _embed = _qc = _qmodels = None
@@ -38,11 +39,18 @@ try:
     _embed = TextEmbedding(model_name=os.environ.get("EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
                            cache_dir=os.path.join(DATA, ".fastembed"))
     _qc = QdrantClient(url=os.environ.get("QDRANT_URL", "http://mnemosyne-qdrant:6333"), timeout=30)
+    for _c in (COLL, CTX_COLL):
+        try:
+            _qc.get_collection(_c)
+        except Exception:
+            _qc.create_collection(_c, vectors_config=_qmodels.VectorParams(
+                size=DIM, distance=_qmodels.Distance.COSINE))
+    # context chunks are filtered by context_id a lot — index that payload field
     try:
-        _qc.get_collection(COLL)
+        _qc.create_payload_index(CTX_COLL, field_name="context_id",
+                                 field_schema=_qmodels.PayloadSchemaType.KEYWORD)
     except Exception:
-        _qc.create_collection(COLL, vectors_config=_qmodels.VectorParams(
-            size=DIM, distance=_qmodels.Distance.COSINE))
+        pass
     USE_VEC = True
     print("[store] vector backend READY (fastembed + qdrant)", flush=True)
 except Exception as e:
@@ -179,3 +187,47 @@ async def recall(request: Request):
     scored.sort(key=lambda x: x[0], reverse=True)
     return {"namespace": ns, "backend": "lexical",
             "items": [{"text": r["text"], "score": round(s, 2)} for s, r in scored[:top_k]]}
+
+
+def _chunk_id(context_id, text):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, context_id + "|" + text))
+
+
+@app.post("/shrink/select")
+async def shrink_select(request: Request):
+    """Window-shrink retrieval with INCREMENTAL indexing.
+    Each chunk is embedded and stored in qdrant exactly once (deterministic id,
+    deduped against what's already there — survives restarts). Only genuinely new
+    chunks get embedded; the query is embedded once and qdrant does the search.
+    Returns the top_k chunk texts (or backend=none so the gateway falls back)."""
+    b = await request.json()
+    context_id = _safe(b.get("context_id", "default"))
+    query = b.get("query") or ""
+    chunks = b.get("chunks") or []
+    top_k = int(b.get("top_k") or 10)
+    if not USE_VEC or not chunks:
+        return {"backend": "none", "chunks": []}
+    try:
+        ids = [_chunk_id(context_id, c) for c in chunks]
+        existing = set()
+        try:
+            got = _qc.retrieve(CTX_COLL, ids=ids, with_payload=False)
+            existing = {str(p.id) for p in got}
+        except Exception:
+            pass
+        new = [(i, c) for i, c in zip(ids, chunks) if i not in existing]
+        if new:
+            vecs = list(_embed.embed([c for _, c in new]))
+            pts = [_qmodels.PointStruct(id=i, vector=v.tolist(),
+                                        payload={"context_id": context_id, "text": c})
+                   for (i, c), v in zip(new, vecs)]
+            _qc.upsert(CTX_COLL, points=pts)
+        res = _qc.search(
+            CTX_COLL, query_vector=_vec(query), limit=top_k,
+            query_filter=_qmodels.Filter(must=[_qmodels.FieldCondition(
+                key="context_id", match=_qmodels.MatchValue(value=context_id))]))
+        return {"backend": "vector", "chunks": [h.payload.get("text") for h in res],
+                "indexed_new": len(new), "searched": len(chunks)}
+    except Exception as e:
+        print(f"[store] shrink_select failed: {e!r}", flush=True)
+        return {"backend": "none", "chunks": []}

@@ -102,65 +102,51 @@ def _query_terms(q: str):
     return [t for t in dict.fromkeys(terms) if t not in _STOP]
 
 
-def shrink_messages(messages, budget_tokens=BUDGET_TOKENS):
-    """Virtualize the window: system + retrieved-relevant-chunks + verbatim tail.
-    Returns (new_messages, info). Lexical retrieval (PoC)."""
+def prepare_shrink(messages):
+    """Split into system + verbatim tail + chunked bulk. Returns a dict, or None
+    if there's nothing to shrink. Tail is token-budgeted and tool-pair safe."""
     system = [m for m in messages if m.get("role") == "system"]
     non_system = [m for m in messages if m.get("role") != "system"]
     if not non_system:
-        return messages, {"shrunk": False}
-
-    # Keep a verbatim recent TAIL up to a token budget (always at least the last
-    # message). A huge message never sits in the tail — it falls into the bulk to
-    # be chunked/retrieved.
-    tail = []
-    bud = 0
+        return None
+    tail, bud = [], 0
     for m in reversed(non_system):
         t = approx_tokens_msgs([m])
         if tail and bud + t > TAIL_TOKENS:
             break
         tail.insert(0, m); bud += t
     bulk = list(non_system[:len(non_system) - len(tail)])
-    # TOOL SAFETY: the tail must not start mid tool-group. If it starts with a
-    # `tool` message, pull its preceding assistant (and any sibling tool msgs)
-    # from the bulk so we never split an assistant(tool_calls) <-> tool pair.
+    # never start the tail mid tool-group (would split assistant(tool_calls)<->tool)
     while bulk and tail and tail[0].get("role") == "tool":
         tail.insert(0, bulk.pop())
-
-    # the query = the latest user message in the tail
+    if not bulk:
+        return None
     query = ""
     for m in reversed(tail):
         if m.get("role") == "user":
-            query = _text_of(m)
-            break
+            query = _text_of(m); break
     if not query:
         query = _text_of(tail[-1])
-    terms = _query_terms(query)
-
-    # chunk the bulk text
     bulk_text = "\n".join(_text_of(m) for m in bulk)
     chunks = [bulk_text[i:i + CHUNK_CHARS] for i in range(0, len(bulk_text), CHUNK_CHARS)]
+    return {"system": system, "tail": tail, "chunks": chunks, "query": query}
 
-    # lexical score: sum of term occurrences (rare terms weighted higher)
+
+def lexical_top(chunks, query, k):
+    """Top-k chunk indices by term overlap (fallback retriever)."""
+    terms = _query_terms(query)
     scored = []
     for idx, ch in enumerate(chunks):
         cl = ch.lower()
         s = sum(cl.count(t) * (1 + len(t) / 8.0) for t in terms)
         if s > 0:
-            scored.append((s, idx, ch))
+            scored.append((s, idx))
     scored.sort(reverse=True)
-    top = scored[:TOP_K]
-    top.sort(key=lambda x: x[1])  # restore document order for readability
-    retrieved = "\n\n---\n".join(c for _, _, c in top)
+    return [i for _, i in scored[:k]]
 
-    info = {
-        "shrunk": True, "n_bulk_msgs": len(bulk), "n_chunks": len(chunks),
-        "matched_chunks": len(scored), "kept_chunks": len(top),
-        "top_scores": [round(s, 1) for s, _, _ in top[:5]], "query_terms": terms[:12],
-    }
-    if not bulk:
-        return messages, {**info, "shrunk": False}
 
+def assemble_shrink(system, selected_chunks, tail):
+    retrieved = "\n\n---\n".join(selected_chunks)
     recall_msg = {
         "role": "system",
         "content": (
@@ -170,9 +156,7 @@ def shrink_messages(messages, budget_tokens=BUDGET_TOKENS):
             f"{retrieved}\n\n[End of retrieved context]"
         ),
     }
-    new_messages = system + [recall_msg] + tail
-    info["new_tokens"] = approx_tokens_msgs(new_messages)
-    return new_messages, info
+    return system + [recall_msg] + tail
 
 
 @app.get("/healthz")
@@ -252,16 +236,33 @@ async def proxy(path: str, request: Request):
 
             # ── SHRINK (opt-in) ────────────────────────────────────────
             if mode == "shrink":
-                new_msgs, info = shrink_messages(msgs)
-                if info.get("shrunk"):
+                prep = prepare_shrink(msgs)
+                if not prep:
+                    log(f"SHRINK ctx={cid} skipped (nothing to shrink)")
+                else:
+                    chunks, query = prep["chunks"], prep["query"]
+                    retrieve = request.headers.get("x-mnemosyne-retrieve", "vector").lower()
+                    selected, method, indexed_new = None, None, None
+                    if retrieve != "lexical":
+                        try:
+                            rr = await client.post(f"{STORE}/shrink/select", timeout=600,
+                                                   json={"context_id": cid, "query": query,
+                                                         "chunks": chunks, "top_k": TOP_K})
+                            j = rr.json()
+                            if j.get("backend") == "vector":
+                                selected = j.get("chunks") or []
+                                method, indexed_new = "vector", j.get("indexed_new")
+                        except Exception as e:
+                            log(f"vector select failed -> lexical: {e!r}")
+                    if selected is None:
+                        idxs = sorted(set(lexical_top(chunks, query, TOP_K)))
+                        selected, method = [chunks[i] for i in idxs], "lexical"
+                    new_msgs = assemble_shrink(prep["system"], selected, prep["tail"])
                     data["messages"] = new_msgs
                     body = json.dumps(data).encode("utf-8")
-                    log(f"SHRINK ctx={cid} {ntok} -> {info.get('new_tokens')} tokens | "
-                        f"chunks={info['n_chunks']} matched={info['matched_chunks']} "
-                        f"kept={info['kept_chunks']} scores={info['top_scores']} "
-                        f"terms={info['query_terms']}")
-                else:
-                    log(f"SHRINK ctx={cid} skipped (nothing to shrink)")
+                    new_tok = approx_tokens_msgs(new_msgs)
+                    log(f"SHRINK ctx={cid} {ntok} -> {new_tok} tokens | method={method} "
+                        f"chunks={len(chunks)} kept={len(selected)} indexed_new={indexed_new}")
         except Exception as e:
             log(f"observe/shrink error: {e!r}")
     else:

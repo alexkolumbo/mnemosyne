@@ -6,6 +6,8 @@ The idea is simple. A model can only look at so many tokens at once, and that li
 
 This sits in front of an OpenAI-compatible endpoint the same way a normal proxy would. I built it against Gonka, but it doesn't care which provider or model is behind it.
 
+It's part of [hermes-stack](https://github.com/alexkolumbo/hermes-stack), a one-script deploy that runs it together with Hermes and the output-cap proxy, though nothing here depends on that.
+
 There are two pieces, on purpose, because state and behaviour are different jobs:
 
 - a store, which just holds things. Conversations by id, and long-term facts by namespace. It can embed text and search it with vectors (fastembed + qdrant), and falls back to plain keyword search if the vector side isn't available.
